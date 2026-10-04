@@ -15,6 +15,7 @@ import (
 	gcsbackend "github.com/gruntwork-io/terragrunt/internal/remotestate/backend/gcs"
 
 	"cloud.google.com/go/storage"
+	"github.com/gruntwork-io/terragrunt/internal/gcphelper"
 	"github.com/gruntwork-io/terragrunt/internal/remotestate"
 	"github.com/gruntwork-io/terragrunt/internal/remotestate/backend"
 	"github.com/gruntwork-io/terragrunt/internal/vfs"
@@ -43,14 +44,22 @@ var gcsStringConfigKeys = []string{
 	"bucket",
 	"credentials",
 	"encryption_key",
+	"impersonate_service_account",
 	"kms_encryption_key",
 	"prefix",
 }
 
-// gcsUnsupportedConfigKeys names settings whose endpoint host or impersonation OAuth scope gcphelper resolves differently.
+// gcsImpersonateServiceAccountEnvKeys names the variables the native backend falls back to, in order, when impersonate_service_account is unset.
+var gcsImpersonateServiceAccountEnvKeys = []string{
+	"GOOGLE_BACKEND_IMPERSONATE_SERVICE_ACCOUNT",
+	"GOOGLE_IMPERSONATE_SERVICE_ACCOUNT",
+}
+
+// gcsImpersonateScopes are the scopes the native backend requests for the impersonated token.
+var gcsImpersonateScopes = []string{storage.ScopeReadWrite}
+
+// gcsUnsupportedConfigKeys names settings whose endpoint host gcphelper resolves differently.
 var gcsUnsupportedConfigKeys = []string{
-	"impersonate_service_account",
-	"impersonate_service_account_delegates",
 	"storage_custom_endpoint",
 	"universe_domain",
 }
@@ -58,11 +67,9 @@ var gcsUnsupportedConfigKeys = []string{
 // gcsUnsupportedEnvKeys names venv variables the native backend honors and gcphelper does not.
 var gcsUnsupportedEnvKeys = []string{
 	"GOOGLE_BACKEND_CREDENTIALS",
-	"GOOGLE_BACKEND_IMPERSONATE_SERVICE_ACCOUNT",
 	"GOOGLE_BACKEND_IMPERSONATE_SERVICE_ACCOUNT_DELEGATES",
 	"GOOGLE_BACKEND_STORAGE_CUSTOM_ENDPOINT",
 	"GOOGLE_BACKEND_UNIVERSE_DOMAIN",
-	"GOOGLE_IMPERSONATE_SERVICE_ACCOUNT",
 	"GOOGLE_IMPERSONATE_SERVICE_ACCOUNT_DELEGATES",
 	"GOOGLE_CLOUD_UNIVERSE_DOMAIN",
 	"GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES",
@@ -101,12 +108,13 @@ var gcsSDKAmbientEnvKeys = []string{
 
 // gcsDirectStateReadSettings carries the backend values the GCS direct-read predicates share.
 type gcsDirectStateReadSettings struct {
-	accessToken             string
-	credentials             string
-	encryptionKey           string
-	kmsEncryptionKey        string
-	accessTokenConfigured   bool
-	encryptionKeyConfigured bool
+	accessToken                              string
+	credentials                              string
+	encryptionKey                            string
+	kmsEncryptionKey                         string
+	accessTokenConfigured                    bool
+	encryptionKeyConfigured                  bool
+	impersonateServiceAccountConfiguredEmpty bool
 }
 
 // gcsDirectStateReadSupported keeps configurations whose native GCS credential or
@@ -240,8 +248,15 @@ func getTerragruntOutputJSONFromRemoteStateGCS(
 	key := gcsStateObjectKey(stateConfig, workspace)
 	location := fmt.Sprintf("gs://%s/%s", bucket, key)
 
+	sessionConfig := extendedConfig.GetGCPSessionConfig()
+	sessionConfig.ImpersonateServiceAccount = gcsEffectiveImpersonateServiceAccount(
+		pctx.Venv.Env,
+		stateConfig.ImpersonateServiceAccount,
+	)
+	sessionConfig.ImpersonateScopes = gcsImpersonateScopes
+
 	open := func(ctx context.Context, l log.Logger) (io.ReadCloser, error) {
-		client, err := gcsbackend.NewClient(ctx, pctx.Venv, extendedConfig, &backend.Options{})
+		client, err := gcphelper.NewGCPConfigBuilder().WithSessionConfig(sessionConfig).BuildGCSClient(ctx, pctx.Venv)
 		if err != nil {
 			return nil, fmt.Errorf("building GCS client for %s: %w", location, err)
 		}
@@ -373,6 +388,10 @@ func gcsBackendConfigSettings(config backend.Config) (gcsDirectStateReadSettings
 		configuredValues[key] = result.configured
 	}
 
+	if !backendConfigStringListValid(config, "impersonate_service_account_delegates") {
+		return gcsDirectStateReadSettings{}, false
+	}
+
 	return gcsDirectStateReadSettings{
 		accessToken:             values["access_token"],
 		credentials:             values["credentials"],
@@ -380,6 +399,8 @@ func gcsBackendConfigSettings(config backend.Config) (gcsDirectStateReadSettings
 		kmsEncryptionKey:        values["kms_encryption_key"],
 		accessTokenConfigured:   configuredValues["access_token"],
 		encryptionKeyConfigured: configuredValues["encryption_key"],
+		impersonateServiceAccountConfiguredEmpty: configuredValues["impersonate_service_account"] &&
+			values["impersonate_service_account"] == "",
 	}, true
 }
 
@@ -454,7 +475,21 @@ func gcsEnvFallbackSuppressionSupported(env map[string]string, settings gcsDirec
 		return false
 	}
 
+	if settings.impersonateServiceAccountConfiguredEmpty &&
+		firstNonEmptyFromMap(env, gcsImpersonateServiceAccountEnvKeys...) != "" {
+		return false
+	}
+
 	return true
+}
+
+// gcsEffectiveImpersonateServiceAccount mirrors the native backend's precedence of a configured service account over the environment.
+func gcsEffectiveImpersonateServiceAccount(env map[string]string, configured string) string {
+	if configured != "" {
+		return configured
+	}
+
+	return firstNonEmptyFromMap(env, gcsImpersonateServiceAccountEnvKeys...)
 }
 
 // gcsEffectiveEncryptionKey mirrors the native backend's precedence of a configured key over the environment.
